@@ -1,5 +1,7 @@
 from datetime import date
 from typing import List, Optional
+from flask import Flask, request, jsonify
+from flask_swagger_ui import get_swaggerui_blueprint
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     create_engine, MetaData, Table, Column,
@@ -9,18 +11,31 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import select
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from db import get_connection
 
-# ---------------------------------------------------------------------------------------
-# Configuration de la base de données
-# ---------------------------------------------------------------------------------------
+
+# Flask app initialization
+app = Flask(__name__)
+
+# Swagger UI configuration
+SWAGGER_URL = '/api/docs'
+API_URL = '/api/swagger.json'
+
+swaggerui_blueprint = get_swaggerui_blueprint(
+    SWAGGER_URL,
+    API_URL,
+    config={
+        'app_name': "Action Plan API"
+    }
+)
+
+app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
+
+# Database configuration
 DATABASE_URL = "postgresql+psycopg2://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Action Plan?sslmode=require"
 engine = create_engine(DATABASE_URL, future=True)
 metadata = MetaData(schema="public")
 
-# Définition des tables
+# Define database tables
 sujet = Table(
     "sujet", metadata,
     Column("id", BigInteger, primary_key=True),
@@ -50,9 +65,9 @@ action = Table(
     Column("updated_at", TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now()),
 )
 
-# ---------------------------------------------------------------------------------------
-# Modèles Pydantic
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------
+# Pydantic models (validation)
+# --------------------------------------------
 VALID_STATUSES = {"open", "closed", "blocked"}
 
 class ActionNode(BaseModel):
@@ -61,7 +76,7 @@ class ActionNode(BaseModel):
     responsable: Optional[str] = None
     priorite: Optional[int] = Field(None, ge=0)
     due_date: Optional[date] = None
-    status: Optional[str] = Field(default="open")
+    status: Optional[str] = Field("open")
     sous_actions: List["ActionNode"] = Field(default_factory=list)
 
     @field_validator("status")
@@ -89,16 +104,17 @@ class PlanV1(BaseModel):
     plan_title: str = Field(..., min_length=1)
     sujets: List[SujetNode] = Field(default_factory=list)
 
-# ---------------------------------------------------------------------------------------
-# Fonctions helper pour la base de données
-# ---------------------------------------------------------------------------------------
+# --------------------------------------------
+# DB helper functions
+# --------------------------------------------
 def upsert_sujet(conn: Connection,
                  titre: str,
                  parent_sujet_id: Optional[int],
                  code: Optional[str],
                  description: Optional[str]) -> int:
     """
-    Upsert d'un sujet par code (si fourni) ou par (parent_sujet_id, titre)
+    Upsert a subject by code (if provided) or by (parent_sujet_id, titre).
+    Returns the subject ID.
     """
     if code:
         stmt = pg_insert(sujet).values(
@@ -114,7 +130,7 @@ def upsert_sujet(conn: Connection,
         ).returning(sujet.c.id)
         return conn.execute(stmt).scalar_one()
     else:
-        # Pas de code fourni: SELECT-then-UPDATE/INSERT
+        # No code: use SELECT-then-UPDATE/INSERT
         if parent_sujet_id is None:
             sel_stmt = select(sujet.c.id).where(
                 sujet.c.parent_sujet_id.is_(None),
@@ -129,7 +145,6 @@ def upsert_sujet(conn: Connection,
         existing_id_row = conn.execute(sel_stmt).first()
         
         if existing_id_row:
-            # Mise à jour
             existing_id = existing_id_row[0]
             upd_stmt = sujet.update().where(
                 sujet.c.id == existing_id
@@ -139,7 +154,6 @@ def upsert_sujet(conn: Connection,
             ).returning(sujet.c.id)
             return conn.execute(upd_stmt).scalar_one()
         else:
-            # Insertion
             ins_stmt = sujet.insert().values(
                 titre=titre,
                 description=description,
@@ -150,13 +164,17 @@ def upsert_sujet(conn: Connection,
 def insert_action_recursive(conn: Connection,
                              sujet_id: int,
                              parent_action_id: Optional[int],
-                             node: ActionNode) -> int:
+                             node: ActionNode,
+                             ordre: int = 0) -> int:
     """
-    Insertion récursive d'une action et de ses sous-actions
+    Insert an action and all its sub-actions recursively.
+    Returns the action ID.
     """
     def level_type(level: int) -> str:
-        if level <= 0: return "action"
-        if level == 1: return "sub_action"
+        if level <= 0: 
+            return "action"
+        if level == 1: 
+            return "sub_action"
         return "sub_sub_action"
 
     act_level = 0
@@ -180,20 +198,21 @@ def insert_action_recursive(conn: Connection,
             priorite=node.priorite,
             responsable=node.responsable,
             due_date=node.due_date,
-            ordre=None
+            ordre=ordre
         ).returning(action.c.id)
     ).first()
     new_id = int(row[0])
 
-    # Récursion sur les sous-actions
-    for child in node.sous_actions:
-        insert_action_recursive(conn, sujet_id, new_id, child)
+    # Recurse for sub-actions
+    for idx, child in enumerate(node.sous_actions):
+        insert_action_recursive(conn, sujet_id, new_id, child, idx)
 
     return new_id
 
 def ingest_sujet_tree(conn: Connection, node: SujetNode, parent_id: Optional[int]) -> int:
     """
-    Ingestion récursive d'un arbre de sujets
+    Recursively ingest a subject tree with actions.
+    Returns the subject ID.
     """
     this_id = upsert_sujet(conn,
                            titre=node.titre,
@@ -201,11 +220,11 @@ def ingest_sujet_tree(conn: Connection, node: SujetNode, parent_id: Optional[int
                            code=node.code,
                            description=node.description)
 
-    # Actions directement sous ce sujet
-    for a in node.actions:
-        insert_action_recursive(conn, sujet_id=this_id, parent_action_id=None, node=a)
+    # Insert actions under this subject
+    for idx, a in enumerate(node.actions):
+        insert_action_recursive(conn, sujet_id=this_id, parent_action_id=None, node=a, ordre=idx)
 
-    # Sujets imbriqués
+    # Insert nested subjects
     for s in node.sous_sujets:
         ingest_sujet_tree(conn, s, this_id)
 
@@ -213,7 +232,8 @@ def ingest_sujet_tree(conn: Connection, node: SujetNode, parent_id: Optional[int
 
 def ingest_plan(conn: Connection, plan: PlanV1) -> int:
     """
-    Crée/met à jour un sujet racine pour le plan et ingère tous les sujets/actions
+    Create/update a root subject for the plan and ingest all subjects/actions.
+    Returns the root subject ID.
     """
     root_code = plan.plan_code
     root_titre = plan.plan_title
@@ -230,49 +250,320 @@ def ingest_plan(conn: Connection, plan: PlanV1) -> int:
 
     return root_id
 
-# ---------------------------------------------------------------------------------------
-# Application FastAPI
-# ---------------------------------------------------------------------------------------
-app = FastAPI(
-    title="Plans d'Action API",
-    description="API pour la gestion des plans d'action avec sujets et actions hiérarchiques",
-    version="1.0"
-)
+# --------------------------------------------
+# Flask routes
+# --------------------------------------------
 
-@app.get("/health")
+@app.route("/api/swagger.json", methods=["GET"])
+def swagger_spec():
+    """OpenAPI specification endpoint"""
+    return jsonify({
+        "openapi": "3.0.0",
+        "info": {
+            "title": "Action Plan API",
+            "description": "API for managing hierarchical action plans with subjects and actions",
+            "version": "1.0.0"
+        },
+        "servers": [
+            {
+                "url": "http://localhost:5000",
+                "description": "Development server"
+            }
+        ],
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Health check",
+                    "description": "Check if the API is running",
+                    "responses": {
+                        "200": {
+                            "description": "API is healthy",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ok": {"type": "boolean"},
+                                            "status": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/schema": {
+                "get": {
+                    "summary": "Get example schema",
+                    "description": "Returns an example JSON structure for action plans",
+                    "responses": {
+                        "200": {
+                            "description": "Example schema",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/PlanV1"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/api/plans": {
+                "post": {
+                    "summary": "Create/Update action plan",
+                    "description": "Ingest a complete action plan with subjects and actions",
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/PlanV1"
+                                },
+                                "example": {
+                                    "version": "1.0",
+                                    "plan_code": "AP-2025-10-OPS-001",
+                                    "plan_title": "Q4 Operations Readiness",
+                                    "sujets": [
+                                        {
+                                            "titre": "Maintenance",
+                                            "code": "OPS-MNT",
+                                            "description": "Preventive maintenance",
+                                            "sous_sujets": [],
+                                            "actions": [
+                                                {
+                                                    "titre": "Create PM checklist",
+                                                    "description": "Draft checklist",
+                                                    "responsable": "jane.doe",
+                                                    "priorite": 2,
+                                                    "due_date": "2025-11-15",
+                                                    "status": "open",
+                                                    "sous_actions": []
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Plan created successfully",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "root_sujet_id": {
+                                                "type": "integer",
+                                                "description": "ID of the root subject"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Validation error",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/Error"
+                                    }
+                                }
+                            }
+                        },
+                        "409": {
+                            "description": "Database integrity error",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/Error"
+                                    }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Server error",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/Error"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "PlanV1": {
+                    "type": "object",
+                    "required": ["version", "plan_title", "sujets"],
+                    "properties": {
+                        "version": {
+                            "type": "string",
+                            "pattern": "^1\\.0$",
+                            "description": "Schema version (must be 1.0)"
+                        },
+                        "plan_code": {
+                            "type": "string",
+                            "nullable": True,
+                            "description": "Unique plan code"
+                        },
+                        "plan_title": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Plan title"
+                        },
+                        "sujets": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/SujetNode"
+                            }
+                        }
+                    }
+                },
+                "SujetNode": {
+                    "type": "object",
+                    "required": ["titre"],
+                    "properties": {
+                        "titre": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Subject title"
+                        },
+                        "code": {
+                            "type": "string",
+                            "nullable": True,
+                            "description": "Unique subject code"
+                        },
+                        "description": {
+                            "type": "string",
+                            "nullable": True,
+                            "description": "Subject description"
+                        },
+                        "sous_sujets": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/SujetNode"
+                            },
+                            "description": "Nested sub-subjects"
+                        },
+                        "actions": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/ActionNode"
+                            },
+                            "description": "Actions under this subject"
+                        }
+                    }
+                },
+                "ActionNode": {
+                    "type": "object",
+                    "required": ["titre"],
+                    "properties": {
+                        "titre": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Action title"
+                        },
+                        "description": {
+                            "type": "string",
+                            "nullable": True,
+                            "description": "Action description"
+                        },
+                        "responsable": {
+                            "type": "string",
+                            "nullable": True,
+                            "description": "Person responsible"
+                        },
+                        "priorite": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "nullable": True,
+                            "description": "Priority level"
+                        },
+                        "due_date": {
+                            "type": "string",
+                            "format": "date",
+                            "nullable": True,
+                            "description": "Due date (YYYY-MM-DD)"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["open", "closed", "blocked"],
+                            "default": "open",
+                            "description": "Action status"
+                        },
+                        "sous_actions": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/components/schemas/ActionNode"
+                            },
+                            "description": "Nested sub-actions"
+                        }
+                    }
+                },
+                "Error": {
+                    "type": "object",
+                    "properties": {
+                        "error": {
+                            "type": "string",
+                            "description": "Error type"
+                        },
+                        "detail": {
+                            "type": "string",
+                            "description": "Error details"
+                        }
+                    }
+                }
+            }
+        }
+    })
+
+@app.route("/health", methods=["GET"])
 def health():
-    """Point de contrôle de santé de l'API"""
-    return {"ok": True}
+    """Health check endpoint"""
+    return jsonify({"ok": True, "status": "running"})
 
-@app.post("/api/plans")
-def post_plan(plan: PlanV1):
+@app.route("/api/plans", methods=["POST"])
+def post_plan():
     """
-    Créer ou mettre à jour un plan d'action complet
+    POST endpoint to ingest an action plan.
+    Body: JSON matching PlanV1 schema
+    Returns: { root_sujet_id: <id> }
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": "invalid_json", "detail": str(e)}), 400
     
-    - **plan**: Structure JSON conforme au schéma PlanV1
-    - **Returns**: ID du sujet racine créé
-    """
-    with engine.begin() as conn:
-        try:
-            root_id = ingest_plan(conn, plan)
-            return {"root_sujet_id": root_id}
-        except IntegrityError as ie:
-            raise HTTPException(
-                status_code=409,
-                detail={"error": "db_integrity_error", "detail": str(ie.orig)}
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail={"error": "server_error", "detail": str(e)}
-            )
+    try:
+        plan = PlanV1.model_validate(data)
+    except Exception as e:
+        return jsonify({"error": "validation_error", "detail": str(e)}), 400
 
-@app.get("/api/schema")
+    try:
+        with engine.begin() as conn:
+            root_id = ingest_plan(conn, plan)
+            return jsonify({"root_sujet_id": root_id}), 201
+    except IntegrityError as ie:
+        return jsonify({"error": "db_integrity_error", "detail": str(ie.orig)}), 409
+    except Exception as e:
+        return jsonify({"error": "server_error", "detail": str(e)}), 500
+
+@app.route("/api/schema", methods=["GET"])
 def get_schema():
     """
-    Retourne un exemple de schéma JSON pour créer un plan d'action
+    Returns example JSON schema for action plans (v1.0)
     """
-    return {
+    return jsonify({
         "version": "1.0",
         "plan_code": "AP-2025-10-OPS-001",
         "plan_title": "Q4 Operations Readiness",
@@ -314,8 +605,29 @@ def get_schema():
                 ]
             }
         ]
-    }
+    })
 
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 errors"""
+    return jsonify({"error": "not_found", "detail": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Handle 500 errors"""
+    return jsonify({"error": "internal_server_error", "detail": str(error)}), 500
+
+# --------------------------------------------
+# Run the application
+# --------------------------------------------
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print("\n" + "="*60)
+    print("🚀 Action Plan API Starting...")
+    print("="*60)
+    print(f"📋 Swagger UI: http://localhost:5000{SWAGGER_URL}")
+    print(f"📄 API Docs: http://localhost:5000{API_URL}")
+    print(f"❤️  Health Check: http://localhost:5000/health")
+    print("="*60 + "\n")
+    
+    # Run Flask development server
+    app.run(host="0.0.0.0", port=5000, debug=True)
