@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-sqlalchemy
+Flask
+flask-swagger-ui
 psycopg2-binary
-pydantic
+sqlalchemy
 python-dotenv
-hypercorn
+pydantic
+Flask-SQLAlchemy
