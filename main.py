@@ -266,7 +266,7 @@ def swagger_spec():
         },
         "servers": [
             {
-                "url": "http://localhost:5000",
+                "url": "https://action-plan-db.azurewebsites.net",
                 "description": "Development server"
             }
         ],
