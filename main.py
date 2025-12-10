@@ -31,7 +31,7 @@ swaggerui_blueprint = get_swaggerui_blueprint(
 app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
 
 # Database configuration
-DATABASE_URL = "postgresql+psycopg2://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/Action Plan?sslmode=require"
+DATABASE_URL = "postgresql+psycopg2://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/ActionPlan_Supplier?sslmode=require"
 engine = create_engine(DATABASE_URL, future=True)
 metadata = MetaData(schema="public")
 
