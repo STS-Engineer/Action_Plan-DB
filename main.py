@@ -36,7 +36,7 @@ engine = create_engine(DATABASE_URL, future=True)
 metadata = MetaData(schema="public")
 
 # database pour meeting 
-DATABASE_URL_MEETING = "postgresql+psycopg2://.../MeetingDB?sslmode=require"
+DATABASE_URL_MEETING = "postgresql+psycopg2://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/ActionPlan_meeting?sslmode=require"
 engine_meeting = create_engine(DATABASE_URL_MEETING, future=True)
 
 # Define database tables
