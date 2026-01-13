@@ -35,6 +35,10 @@ DATABASE_URL = "postgresql+psycopg2://administrationSTS:St%24%400987@avo-adb-002
 engine = create_engine(DATABASE_URL, future=True)
 metadata = MetaData(schema="public")
 
+# database pour meeting 
+DATABASE_URL_MEETING = "postgresql+psycopg2://.../MeetingDB?sslmode=require"
+engine_meeting = create_engine(DATABASE_URL_MEETING, future=True)
+
 # Define database tables
 sujet = Table(
     "sujet", metadata,
@@ -557,6 +561,33 @@ def post_plan():
         return jsonify({"error": "db_integrity_error", "detail": str(ie.orig)}), 409
     except Exception as e:
         return jsonify({"error": "server_error", "detail": str(e)}), 500
+        
+@app.route("/api/plans-meeting", methods=["POST"])
+def post_plan_meeting():
+    """
+    POST endpoint to ingest an action plan into Meeting DB.
+    Body: JSON matching PlanV1 schema
+    Returns: { root_sujet_id: <id> }
+    """
+    try:
+        data = request.get_json(force=True)
+    except Exception as e:
+        return jsonify({"error": "invalid_json", "detail": str(e)}), 400
+
+    try:
+        plan = PlanV1.model_validate(data)
+    except Exception as e:
+        return jsonify({"error": "validation_error", "detail": str(e)}), 400
+
+    try:
+        with engine_meeting.begin() as conn:
+            root_id = ingest_plan(conn, plan)
+            return jsonify({"root_sujet_id": root_id}), 201
+    except IntegrityError as ie:
+        return jsonify({"error": "db_integrity_error", "detail": str(ie.orig)}), 409
+    except Exception as e:
+        return jsonify({"error": "server_error", "detail": str(e)}), 500
+
 
 @app.route("/api/schema", methods=["GET"])
 def get_schema():
