@@ -16,3 +16,15 @@ def get_connection():
         password="St$@0987",
         sslmode="require"
     )
+def get_connection_Meeting():
+    """
+    Connexion au serveur PostgreSQL .
+    """
+    return psycopg2.connect(
+        host="avo-adb-002.postgres.database.azure.com",
+        port=5432,
+        database="ActionPlan_meeting",
+        user="administrationSTS",
+        password="St$@0987",
+        sslmode="require"
+    )
